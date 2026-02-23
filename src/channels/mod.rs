@@ -19,6 +19,7 @@ pub mod cli;
 pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
+pub mod history;
 pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
@@ -790,6 +791,35 @@ fn rollback_orphan_user_turn(
     true
 }
 
+fn persist_incoming_channel_history(ctx: &ChannelRuntimeContext, msg: &traits::ChannelMessage) {
+    history::append_message_non_blocking(
+        Arc::clone(&ctx.workspace_dir),
+        history::ChannelHistoryMessage::incoming(
+            msg.channel.clone(),
+            msg.sender.clone(),
+            msg.sender.clone(),
+            msg.content.clone(),
+            msg.timestamp,
+        ),
+    );
+}
+
+fn persist_outgoing_channel_history(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    content: &str,
+) {
+    history::append_message_non_blocking(
+        Arc::clone(&ctx.workspace_dir),
+        history::ChannelHistoryMessage::outgoing(
+            msg.channel.clone(),
+            msg.sender.clone(),
+            history::CHANNEL_HISTORY_BOT_SENDER.to_string(),
+            content.to_string(),
+        ),
+    );
+}
+
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     if memory::is_assistant_autosave_key(key) {
         return true;
@@ -1029,13 +1059,17 @@ async fn handle_runtime_command_if_needed(
     };
 
     if let Err(err) = channel
-        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .send(
+            &SendMessage::new(response.clone(), &msg.reply_target).in_thread(msg.thread_ts.clone()),
+        )
         .await
     {
         tracing::warn!(
             "Failed to send runtime command response on {}: {err}",
             channel.name()
         );
+    } else {
+        persist_outgoing_channel_history(ctx, msg, &response);
     }
 
     true
@@ -1502,6 +1536,7 @@ async fn process_channel_message(
             "content_preview": truncate_with_ellipsis(&msg.content, 160),
         }),
     );
+    persist_incoming_channel_history(ctx.as_ref(), &msg);
 
     // ── Hook: on_message_received (modifying) ────────────
     let msg = if let Some(hooks) = &ctx.hooks {
@@ -1535,6 +1570,7 @@ async fn process_channel_message(
                 "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
                 route.provider
             );
+            persist_outgoing_channel_history(ctx.as_ref(), &msg, &message);
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
                     .send(
@@ -1836,6 +1872,7 @@ async fn process_channel_message(
             } else {
                 sanitized_response
             };
+            persist_outgoing_channel_history(ctx.as_ref(), &msg, &delivered_response);
             runtime_trace::record_event(
                 "channel_message_outbound",
                 Some(msg.channel.as_str()),
@@ -1931,6 +1968,7 @@ async fn process_channel_message(
                 } else {
                     "⚠️ Context window exceeded for this conversation. Please resend your last message."
                 };
+                persist_outgoing_channel_history(ctx.as_ref(), &msg, error_text);
                 eprintln!(
                     "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
                     started_at.elapsed().as_millis(),
@@ -1998,15 +2036,17 @@ async fn process_channel_message(
                         ChatMessage::assistant("[Task failed — not continuing this request]"),
                     );
                 }
+                let error_text = format!("⚠️ Error: {e}");
+                persist_outgoing_channel_history(ctx.as_ref(), &msg, &error_text);
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, draft_id, &error_text)
                             .await;
                     } else {
                         let _ = channel
                             .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                &SendMessage::new(error_text, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
@@ -2047,6 +2087,7 @@ async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
                     "⚠️ Request timed out while waiting for the model. Please try again.";
+                persist_outgoing_channel_history(ctx.as_ref(), &msg, error_text);
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
                         .finalize_draft(&msg.reply_target, draft_id, error_text)
@@ -4160,6 +4201,85 @@ BTC is currently around $65,000 based on latest tool output."#
             !assistant_turn.content.contains("[Used tools:"),
             "telegram history should not persist tool-summary prefix"
         );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_persists_markdown_history_for_telegram() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-telegram-history-1".to_string(),
+                sender: "8443845544".to_string(),
+                reply_target: "chat-telegram-history".to_string(),
+                content: "hey, remember this".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1_706_382_600,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let history_path = workspace
+            .path()
+            .join("history")
+            .join("telegram")
+            .join("8443845544.md");
+
+        let mut history = String::new();
+        for _ in 0..50 {
+            if let Ok(content) = tokio::fs::read_to_string(&history_path).await {
+                if content.contains("(incoming)") && content.contains("(outgoing)") {
+                    history = content;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            !history.is_empty(),
+            "history file should contain both incoming and outgoing entries"
+        );
+        assert!(history.contains("# Conversation with telegram_8443845544"));
+        assert!(history.contains("`channel=telegram`"));
+        assert!(history.contains("**8443845544**: hey, remember this"));
+        assert!(history.contains("**zeroclaw_bot**: ok"));
     }
 
     #[tokio::test]
